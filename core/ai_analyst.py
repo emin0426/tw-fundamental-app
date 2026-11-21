@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -80,7 +81,7 @@ def build_analysis_prompt(
 
 
 class GeminiStockAnalyst:
-    """On-demand Gemini API client with fast thinking budget, 120s timeout, and auto model discovery."""
+    """On-demand Gemini API client with 503 auto-retry and multi-model fallback (Flash -> Flash-Lite -> Gemma)."""
 
     def __init__(
         self,
@@ -99,7 +100,11 @@ class GeminiStockAnalyst:
         }
 
     def _call_model(
-        self, model_name: str, prompt: str, use_thinking_budget: bool = True
+        self,
+        model_name: str,
+        prompt: str,
+        use_thinking_budget: bool = True,
+        retries: int = 2,
     ) -> requests.Response:
         clean_name = model_name.replace("models/", "").strip()
         url = GEMINI_ENDPOINT_TMPL.format(model=clean_name)
@@ -107,45 +112,66 @@ class GeminiStockAnalyst:
             "temperature": 0.25,
             "maxOutputTokens": 1800,
         }
-        if use_thinking_budget:
-            # Cap internal thinking so response finishes in ~5-12s instead of timing out
+        # Gemma models do not use thinkingConfig
+        if use_thinking_budget and "gemma" not in clean_name.lower():
             gen_cfg["thinkingConfig"] = {"thinkingBudget": 512}
 
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": gen_cfg,
         }
-        resp = requests.post(
-            url,
-            headers=self._headers(),
-            data=json.dumps(payload),
-            timeout=(15, 120),
-        )
-        # If this specific model doesn't support thinkingConfig, retry immediately without it
-        if resp.status_code == 400 and use_thinking_budget and "thinking" in resp.text.lower():
-            return self._call_model(model_name, prompt, use_thinking_budget=False)
+
+        resp: Optional[requests.Response] = None
+        for attempt in range(retries):
+            resp = requests.post(
+                url,
+                headers=self._headers(),
+                data=json.dumps(payload),
+                timeout=(15, 90),
+            )
+            if resp.status_code == 400 and use_thinking_budget and "thinking" in resp.text.lower():
+                return self._call_model(model_name, prompt, use_thinking_budget=False, retries=retries)
+            if resp.status_code in (500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(2.0)
+                continue
+            return resp
+        assert resp is not None
         return resp
 
-    def _discover_available_flash_model(self) -> Optional[str]:
-        """Query Google API to auto-pick the newest active Gemini Flash model on this account."""
+    def _discover_fallback_models(self) -> List[str]:
+        """Discover all active free-tier text models (Flash, Flash-Lite, Gemma 4/3) to bypass 503 spikes."""
         try:
             resp = requests.get(GEMINI_MODELS_LIST_URL, headers=self._headers(), timeout=(10, 20))
             if not resp.ok:
-                return None
+                return []
             models = resp.json().get("models", [])
-            candidates: List[str] = []
+            skip_keywords = ("image", "audio", "tts", "embed", "aqa", "veo", "imagen", "robotics", "computer-use")
+            flash_lite: List[str] = []
+            flash_other: List[str] = []
+            gemma_models: List[str] = []
+
             for m in models:
                 methods = m.get("supportedGenerationMethods", [])
                 name = str(m.get("name", "")).replace("models/", "")
-                if "generateContent" in methods and "gemini" in name.lower() and "flash" in name.lower():
-                    if "image" not in name.lower() and "audio" not in name.lower() and "tts" not in name.lower():
-                        candidates.append(name)
-            if not candidates:
-                return None
-            stable = [c for c in candidates if "exp" not in c and "preview" not in c]
-            return sorted(stable)[-1] if stable else sorted(candidates)[-1]
+                low = name.lower()
+                if "generateContent" not in methods or any(k in low for k in skip_keywords):
+                    continue
+                if "gemini" in low and "flash-lite" in low:
+                    flash_lite.append(name)
+                elif "gemini" in low and "flash" in low:
+                    flash_other.append(name)
+                elif "gemma" in low and ("27b" in low or "31b" in low or "26b" in low or "12b" in low):
+                    gemma_models.append(name)
+
+            # Prioritize Flash-Lite (least congested) -> other Flash -> Gemma large models
+            ordered = (
+                sorted(flash_lite, reverse=True)
+                + sorted(flash_other, reverse=True)
+                + sorted(gemma_models, reverse=True)
+            )
+            return ordered[:6]
         except Exception:
-            return None
+            return []
 
     def generate_report(
         self,
@@ -174,39 +200,39 @@ class GeminiStockAnalyst:
         fallback_note = ""
 
         try:
-            resp = self._call_model(active_model, prompt)
+            resp = self._call_model(active_model, prompt, retries=2)
         except requests.exceptions.Timeout:
-            return (
-                "⚠️ Gemini 伺服器回應逾時（超過 120 秒），可能是免費尖峰時段較忙碌，請稍候再點一次「啟動第二層 AI 分析」即可。"
-            )
+            resp = None
 
-        # Auto-fallback chain: try DEFAULT_GEMINI_MODEL (gemini-3.8-flash), then live auto-discovery
-        if resp.status_code in (400, 404):
+        # Auto-fallback on timeout, 400/404 (retired model), 429 (quota), or 503 (high demand spike)
+        if resp is None or resp.status_code in (400, 404, 429, 503):
+            orig_code = resp.status_code if resp is not None else "逾時"
             tried = {active_model}
-            retry_models = [DEFAULT_GEMINI_MODEL]
-            discovered = self._discover_available_flash_model()
-            if discovered:
-                retry_models.append(discovered)
+            retry_models = [DEFAULT_GEMINI_MODEL] + self._discover_fallback_models()
 
             for cand in retry_models:
                 if cand in tried:
                     continue
                 tried.add(cand)
                 try:
-                    resp_retry = self._call_model(cand, prompt)
+                    resp_retry = self._call_model(cand, prompt, retries=1)
                 except requests.exceptions.Timeout:
                     continue
                 if resp_retry.ok:
+                    reason = "目前尖峰塞車" if orig_code == 503 else f"暫時不可用（{orig_code}）"
                     fallback_note = (
-                        f"ℹ️ 提示：原模型「{active_model}」已停用或不適用，已自動切換為 **{cand}** 完成分析"
-                        f"（建議到 ⚙ API 設定將模型更新為 `{cand}`）。\n\n"
+                        f"ℹ️ 提示：主力模型 `{active_model}` {reason}，已自動切換為備援免費模型 **`{cand}`** 完成分析。\n\n"
                     )
                     resp = resp_retry
                     active_model = cand
                     break
 
+        if resp is None:
+            return "⚠️ Gemini 伺服器回應逾時，可能是免費尖峰時段較忙碌，請稍候再點一次即可。"
         if resp.status_code == 429:
             return "⚠️ 已觸及 Gemini API 免費方案每分鐘／每日請求上限，請稍候 1 分鐘後再試。"
+        if resp.status_code == 503:
+            return "⚠️ Google 免費伺服器目前剛好流量尖峰塞車（HTTP 503），所有備援模型亦暫時滿載，請等 30 秒後再點一次按鈕即可，不用修改任何設定。"
         if not resp.ok:
             err_msg = f"HTTP {resp.status_code}"
             try:
@@ -216,10 +242,7 @@ class GeminiStockAnalyst:
                     err_msg = f"HTTP {resp.status_code}（{detail}）"
             except Exception:
                 pass
-            return (
-                f"⚠️ Gemini AI 呼叫失敗：{err_msg}\n"
-                f"請檢查「⚙ API 設定」中的 API Key 是否正確，並將模型名稱改為 `{DEFAULT_GEMINI_MODEL}`。"
-            )
+            return f"⚠️ Gemini AI 呼叫失敗：{err_msg}"
 
         data = resp.json()
         candidates = data.get("candidates", [])
