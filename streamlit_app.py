@@ -1,7 +1,8 @@
-"""Mobile-Friendly Route-A Streamlit Web App for Taiwan Stock Fundamental Analyzer.
+"""Mobile-Friendly Route-A Streamlit Web App for Taiwan Stock Fundamental Analyzer (v1.5).
 
-Deploy directly to Streamlit Community Cloud (free) so you can look up ANY Taiwan stock
-from your phone with API keys safely stored in Streamlit Cloud Secrets.
+Security fix (v1.5):
+- Server-side Secrets (FINMIND_TOKEN, GEMINI_API_KEY) are NEVER sent to browser input fields.
+- Invited viewers only see a green status badge and can never view or reveal your API keys.
 """
 
 from __future__ import annotations
@@ -28,13 +29,13 @@ st.set_page_config(
 
 
 def _load_secret_or_config(key: str, default: str = "") -> str:
-    # 1. Streamlit Cloud Secrets
+    # 1. Streamlit Cloud Secrets (server-side only)
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
     except Exception:
         pass
-    # 2. Local config.json fallback
+    # 2. Local config.json fallback (when running streamlit locally)
     cfg_path = Path(__file__).resolve().parent / "config.json"
     if cfg_path.exists():
         try:
@@ -72,24 +73,32 @@ def _format_statement_df(df: pd.DataFrame, pct_cols: set | None = None) -> pd.Da
     return out
 
 
-# Sidebar Settings (optional override if not using Streamlit Cloud Secrets)
+# Read secrets strictly on server side (NEVER pass into st.text_input value!)
+_server_finmind = _load_secret_or_config("FINMIND_TOKEN", "")
+_server_gemini = _load_secret_or_config("GEMINI_API_KEY", "")
+_server_model = _load_secret_or_config("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+
+# Sidebar Settings (safe for shared/invited viewers — zero secret exposure)
 with st.sidebar:
-    st.header("⚙ API 設定")
-    finmind_token = st.text_input(
-        "FinMind Token（選填）",
-        value=_load_secret_or_config("FINMIND_TOKEN", ""),
-        type="password",
-    )
-    gemini_api_key = st.text_input(
-        "Gemini API Key（免費額度）",
-        value=_load_secret_or_config("GEMINI_API_KEY", ""),
-        type="password",
-    )
-    gemini_model = st.text_input(
-        "Gemini 模型",
-        value=_load_secret_or_config("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-    )
+    st.header("⚙ 系統設定")
+    if _server_finmind:
+        st.success("🔒 FinMind 資料源：已由後台安全載入")
+    if _server_gemini:
+        st.success("🔒 Gemini AI：已由後台安全載入")
+
+    if not _server_finmind or not _server_gemini:
+        with st.expander("🔑 本機自訂 API 金鑰（僅本機測試用）", expanded=True):
+            custom_fm = st.text_input("FinMind Token", value="", type="password", placeholder="貼上 FinMind Token")
+            custom_gm = st.text_input("Gemini API Key", value="", type="password", placeholder="貼上 Gemini API Key")
+    else:
+        custom_fm = ""
+        custom_gm = ""
+
+    gemini_model = st.text_input("Gemini 模型", value=_server_model)
     force_refresh = st.checkbox("略過快取強制重新抓取", value=False)
+
+finmind_token = custom_fm.strip() or _server_finmind
+gemini_api_key = custom_gm.strip() or _server_gemini
 
 st.title("📊 台股個股財報深度分析")
 
