@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import tempfile
 import time
@@ -14,13 +13,15 @@ from typing import Any, Optional
 class TieredCache:
     """Simple thread-safe SQLite key-value cache with per-entry TTL."""
 
-    TTL_QUOTE = 5 * 60             # 5 minutes for latest price
-    TTL_MARKET_VAL = 24 * 3600     # 1 day for market-wide PE/PB snapshot
-    TTL_MONTHLY_REV = 24 * 3600    # 1 day for monthly revenue
-    TTL_FINANCIALS = 7 * 24 * 3600 # 7 days for quarterly/annual financials
-    TTL_STOCK_LIST = 7 * 24 * 3600 # 7 days for stock symbol/name map
-    TTL_NEWS = 6 * 3600            # 6 hours for news & announcements
-    TTL_AI_REPORT = 24 * 3600      # 1 day for AI summaries (saves free quota)
+    TTL_QUOTE = 5 * 60                  # 5 minutes for latest price
+    TTL_MARKET_VAL = 24 * 3600          # 1 day for market-wide PE/PB snapshot
+    TTL_MONTHLY_REV = 24 * 3600         # 1 day for monthly revenue
+    TTL_FINANCIALS = 7 * 24 * 3600      # 7 days for quarterly/annual financials
+    TTL_STOCK_LIST = 7 * 24 * 3600      # 7 days for stock symbol/name map
+    TTL_NEWS = 6 * 3600                 # 6 hours for news & announcements
+    TTL_AI_REPORT = 24 * 3600           # 1 day for AI summaries (saves free quota)
+    TTL_TDCC_LATEST = 24 * 3600         # 1 day for latest TDCC date list / snapshot
+    TTL_TDCC_HIST_WEEK = 90 * 24 * 3600 # 90 days for immutable historical TDCC weeks
 
     def __init__(self, db_path: Optional[str] = None) -> None:
         if db_path:
@@ -34,7 +35,6 @@ class TieredCache:
                 test_file.unlink(missing_ok=True)
                 self.db_path = default_dir / "tw_fundamental_cache.db"
             except OSError:
-                # Fallback to temp directory on read-only cloud containers
                 tmp_dir = Path(tempfile.gettempdir()) / "tw_fundamental_cache"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
                 self.db_path = tmp_dir / "tw_fundamental_cache.db"

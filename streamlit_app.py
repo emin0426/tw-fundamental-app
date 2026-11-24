@@ -1,8 +1,10 @@
-"""Mobile-Friendly Route-A Streamlit Web App for Taiwan Stock Fundamental Analyzer (v1.5).
+"""Mobile-Friendly Route-A Streamlit Web App for Taiwan Stock Fundamental Analyzer (v1.7).
 
-Security fix (v1.5):
-- Server-side Secrets (FINMIND_TOKEN, GEMINI_API_KEY) are NEVER sent to browser input fields.
-- Invited viewers only see a green status badge and can never view or reveal your API keys.
+Updates in v1.7:
+- Redesigned TDCC Chip-Flow tab (removed static 15-tier table):
+  1. Dual-axis Major (400+ lots %) vs. Retail (<10 lots %) interactive touch/hover chart (independent auto-scaled Y-axes, legend on top).
+  2. Weekly Major (400+ lots) % Change Red/Green Bar Chart (red = buy, green = sell).
+  3. Dual-axis Major Headcount vs. Retail Headcount interactive touch/hover chart (auto-scaled).
 """
 
 from __future__ import annotations
@@ -18,7 +20,8 @@ import streamlit as st
 from core.ai_analyst import DEFAULT_GEMINI_MODEL, GeminiStockAnalyst
 from core.analyzer import analyze_stock_bundle
 from core.cache import TieredCache
-from core.data_fetcher import TaiwanStockDataFetcher
+from core.data_fetcher import TDCC_QRY_URL, TaiwanStockDataFetcher
+from core.tdcc_analyzer import analyze_tdcc_dispersion
 
 st.set_page_config(
     page_title="台股個股財報深度分析",
@@ -29,13 +32,11 @@ st.set_page_config(
 
 
 def _load_secret_or_config(key: str, default: str = "") -> str:
-    # 1. Streamlit Cloud Secrets (server-side only)
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
     except Exception:
         pass
-    # 2. Local config.json fallback (when running streamlit locally)
     cfg_path = Path(__file__).resolve().parent / "config.json"
     if cfg_path.exists():
         try:
@@ -73,12 +74,10 @@ def _format_statement_df(df: pd.DataFrame, pct_cols: set | None = None) -> pd.Da
     return out
 
 
-# Read secrets strictly on server side (NEVER pass into st.text_input value!)
 _server_finmind = _load_secret_or_config("FINMIND_TOKEN", "")
 _server_gemini = _load_secret_or_config("GEMINI_API_KEY", "")
 _server_model = _load_secret_or_config("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 
-# Sidebar Settings (safe for shared/invited viewers — zero secret exposure)
 with st.sidebar:
     st.header("⚙ 系統設定")
     if _server_finmind:
@@ -102,7 +101,6 @@ gemini_api_key = custom_gm.strip() or _server_gemini
 
 st.title("📊 台股個股財報深度分析")
 
-# Search Bar + Mobile Quick Picks
 col_in, col_btn = st.columns([3, 1])
 with col_in:
     default_q = st.session_state.get("stock_query", "2330")
@@ -154,6 +152,7 @@ if run_search or ("bundle" not in st.session_state):
             )
             st.session_state.pop("ai_report_text", None)
             st.session_state.pop("news_bundle", None)
+            st.session_state.pop("tdcc_result", None)
         except Exception as exc:
             st.error(f"資料抓取失敗：{exc}")
             st.stop()
@@ -168,7 +167,15 @@ st.caption(
 )
 
 tabs = st.tabs(
-    ["📊 總覽與估值", "📈 月營收", "📑 損益表", "🏦 資產負債表", "💰 現金流量表", "✨ AI 診斷與訂單"]
+    [
+        "📊 總覽與估值",
+        "📈 月營收",
+        "📑 損益表",
+        "🏦 資產負債表",
+        "💰 現金流量表",
+        "🎯 集保籌碼 (每週)",
+        "✨ AI 診斷與訂單",
+    ]
 )
 
 # --- Tab 1: Overview & Valuation ---
@@ -229,7 +236,11 @@ with tabs[1]:
         bar = (
             alt.Chart(chart_df)
             .mark_bar(color="#4A90E2")
-            .encode(x=alt.X("月份:N", sort=None), y=alt.Y("營收(千元):Q", title="營收(千元)"), tooltip=["月份", "營收(千元)", "年增率(%)", "月增率(%)"])
+            .encode(
+                x=alt.X("月份:N", sort=None),
+                y=alt.Y("營收(千元):Q", title="營收(千元)"),
+                tooltip=["月份", "營收(千元)", "年增率(%)", "月增率(%)"],
+            )
         )
         st.altair_chart(bar.properties(height=260), use_container_width=True)
         disp_cols = ["月份", "營收(千元)", "月增率(%)", "年增率(%)", "累計營收(千元)", "累計年增率(%)"]
@@ -263,8 +274,124 @@ with tabs[4]:
     with st.expander("🔍 展開完整現金流量表科目"):
         st.dataframe(_format_statement_df(bundle["cashflow_q_full"]), use_container_width=True, hide_index=True)
 
-# --- Tab 6: AI Layer-2 & Order Visibility ---
+# --- Tab 6: TDCC Weekly Chip-Flow Dashboard (v1.7 Dual-Axis + Bars + Touch Tooltips) ---
 with tabs[5]:
+    st.caption("資料來源：臺灣集中保管結算所（每週六更新；手指點擊或滑鼠移到任一節點即可看該週精確數據）。")
+    c_wk, c_go = st.columns([2, 2])
+    with c_wk:
+        tdcc_weeks = st.radio("抓取歷史週數", [12, 24], index=0, horizontal=True, format_func=lambda w: f"近 {w} 週")
+    with c_go:
+        load_tdcc = st.button("📥 載入集保籌碼流向走勢圖", type="primary", use_container_width=True)
+
+    cached_tdcc = cache.get(f"tdcc_bundle:{meta['stock_id']}:{tdcc_weeks}")
+    if load_tdcc:
+        prog = st.progress(0.0, text=f"正在抓取 {meta['stock_id']} 近 {tdcc_weeks} 週集保資料...")
+
+        def _on_prog(done: int, total: int) -> None:
+            prog.progress(done / max(total, 1), text=f"正在抓取集保歷史週資料 ({done}/{total} 週)...")
+
+        raw_tdcc = fetcher.get_tdcc_dispersion(
+            meta["stock_id"], weeks=tdcc_weeks, force_refresh=force_refresh, progress_cb=_on_prog
+        )
+        prog.empty()
+        st.session_state["tdcc_result"] = analyze_tdcc_dispersion(raw_tdcc)
+    elif "tdcc_result" not in st.session_state and cached_tdcc:
+        st.session_state["tdcc_result"] = analyze_tdcc_dispersion(cached_tdcc)
+
+    tdcc_res = st.session_state.get("tdcc_result")
+    if tdcc_res and tdcc_res.get("has_data"):
+        s = tdcc_res["summary"]
+        sig_icon = {"green": "🟢", "yellow": "🟡", "red": "🔴", "info": "🔵"}.get(s["signal_status"], "⚪")
+        st.info(
+            f"**{sig_icon} 籌碼流向判讀：{s['signal_title']}**（基準日 `{s['latest_date']}`｜{s['weeks_count']} 週）\n\n"
+            f"{s['signal_desc']}"
+        )
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("400張以上大戶 (%)", f"{s['major_400_pct']:.2f}%", delta=f"{s['d_400_1w']:+.2f}% (週)")
+        k2.metric("400張以上大戶人數", f"{s['major_400_people']:,} 人", delta=f"{s['d_m400_ppl_1w']:+,} 人 (週)")
+        k3.metric("散戶 10張以下 (%)", f"{s['retail_10_pct']:.2f}%", delta=f"{s['d_ret10_1w']:+.2f}% (週)", delta_color="inverse")
+        k4.metric("散戶 10張以下人數", f"{s['retail_10_people']:,} 人", delta=f"{s['d_ret10_ppl_1w']:+,} 人 (週)", delta_color="inverse")
+
+        trend_df = tdcc_res["trend_df"].copy()
+        if len(trend_df) >= 2:
+            full_tooltips = [
+                alt.Tooltip("日期:N", title="基準日"),
+                alt.Tooltip("400張以上大戶(%):Q", title="400張大戶(%)", format=".2f"),
+                alt.Tooltip("400張大戶週增減(%):Q", title="大戶週增減(%)", format="+.2f"),
+                alt.Tooltip("400張以上大戶人數:Q", title="400張大戶人數", format=","),
+                alt.Tooltip("1000張以上大戶(%):Q", title="1000張大戶(%)", format=".2f"),
+                alt.Tooltip("散戶_10張以下(%):Q", title="散戶10張以下(%)", format=".2f"),
+                alt.Tooltip("散戶_10張以下人數:Q", title="散戶10張以下人數", format=","),
+                alt.Tooltip("總股東人數:Q", title="總股東人數", format=","),
+            ]
+
+            # Chart 1: Dual-Axis Scissor Spread (400+ Major % vs <10 Retail %)
+            st.subheader("① 大戶 vs. 散戶持股比例雙軸走勢（紅升藍降＝籌碼集中）")
+            base1 = alt.Chart(trend_df).encode(x=alt.X("日期:N", sort=None, title="集保基準日"))
+            line_major = base1.mark_line(point=alt.OverlayMarkDef(size=55), color="#E53935", strokeWidth=2.5).encode(
+                y=alt.Y("400張以上大戶(%):Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="400張以上大戶 (%)", titleColor="#E53935")),
+                tooltip=full_tooltips,
+            )
+            line_retail = base1.mark_line(point=alt.OverlayMarkDef(size=55), color="#1E88E5", strokeWidth=2.2, strokeDash=[5, 3]).encode(
+                y=alt.Y("散戶_10張以下(%):Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="散戶 10張以下 (%)", titleColor="#1E88E5")),
+                tooltip=full_tooltips,
+            )
+            st.altair_chart(
+                alt.layer(line_major, line_retail).resolve_scale(y="independent").properties(height=270),
+                use_container_width=True,
+            )
+
+            # Chart 2: Weekly 400+ Major % Change Red/Green Bar Chart
+            st.subheader("② 400張以上大戶「每週增減」柱狀圖（紅柱加碼｜綠柱減碼）")
+            bar_chart = (
+                alt.Chart(trend_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("日期:N", sort=None, title="集保基準日"),
+                    y=alt.Y("400張大戶週增減(%):Q", title="每週增減 (%)"),
+                    color=alt.condition(
+                        alt.datum["400張大戶週增減(%)"] >= 0,
+                        alt.value("#E53935"),
+                        alt.value("#2E7D32"),
+                    ),
+                    tooltip=full_tooltips,
+                )
+                .properties(height=210)
+            )
+            st.altair_chart(bar_chart, use_container_width=True)
+
+            # Chart 3: Dual-Axis Headcount (400+ Major Headcount vs <10 Retail Headcount)
+            st.subheader("③ 大戶人數 vs. 散戶人數雙軸走勢（各自縮放看人數消長）")
+            base3 = alt.Chart(trend_df).encode(x=alt.X("日期:N", sort=None, title="集保基準日"))
+            line_mppl = base3.mark_line(point=alt.OverlayMarkDef(size=55), color="#FB8C00", strokeWidth=2.5).encode(
+                y=alt.Y("400張以上大戶人數:Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="400張以上大戶人數", titleColor="#FB8C00")),
+                tooltip=full_tooltips,
+            )
+            line_rppl = base3.mark_line(point=alt.OverlayMarkDef(size=55), color="#26A69A", strokeWidth=2.2).encode(
+                y=alt.Y("散戶_10張以下人數:Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="散戶 10張以下人數", titleColor="#26A69A")),
+                tooltip=full_tooltips,
+            )
+            st.altair_chart(
+                alt.layer(line_mppl, line_rppl).resolve_scale(y="independent").properties(height=260),
+                use_container_width=True,
+            )
+
+        with st.expander("📅 展開每週大戶／散戶歷史數據表"):
+            show_cols = [
+                "日期", "400張以上大戶(%)", "400張大戶週增減(%)", "400張以上大戶人數",
+                "1000張以上大戶(%)", "散戶_10張以下(%)", "散戶_10張以下人數", "總股東人數",
+            ]
+            st.dataframe(trend_df[show_cols].iloc[::-1], use_container_width=True, hide_index=True)
+    elif load_tdcc:
+        st.warning(f"暫時無法取得 {meta['stock_id']} 的集保資料，請稍後再試或前往 [集保結算所官網]({TDCC_QRY_URL}) 查詢。")
+    else:
+        st.markdown(
+            "點擊上方 **「📥 載入集保籌碼流向走勢圖」** 即可繪製大戶 vs. 散戶雙軸走勢、每週紅綠增減柱狀圖與大戶／散戶人數變化圖。"
+        )
+
+# --- Tab 7: AI Layer-2 & Order Visibility ---
+with tabs[6]:
     st.caption("按下按鈕才會呼叫 Gemini 免費額度，平常滑財報完全不消耗額度。")
     pdf_file = st.file_uploader("選填：上傳最新法說會簡報 PDF（強化訂單能見度分析）", type=["pdf"])
     pdf_text = ""
@@ -299,6 +426,7 @@ with tabs[5]:
         sid = meta["stock_id"]
         st.markdown(
             f"**官方免費查證連結**："
+            f"[集保戶股權分散表]({TDCC_QRY_URL}) ｜ "
             f"[產業價值鏈資訊平台](https://ic.tpex.org.tw/company_chain.php?stk_code={sid}) ｜ "
             f"[IR 法說會查詢](https://irengage.taiwanindex.com.tw/conferenceList) ｜ "
             f"[TWSE WebPro 法說影音](https://webpro.twse.com.tw/WebPortal/vod/101/?categoryId=148)"
