@@ -1,10 +1,10 @@
-"""Mobile-Friendly Route-A Streamlit Web App for Taiwan Stock Fundamental Analyzer (v1.7).
+"""Mobile-Friendly Route-A Streamlit Web App for Taiwan Stock Fundamental Analyzer (v1.8).
 
-Updates in v1.7:
-- Redesigned TDCC Chip-Flow tab (removed static 15-tier table):
-  1. Dual-axis Major (400+ lots %) vs. Retail (<10 lots %) interactive touch/hover chart (independent auto-scaled Y-axes, legend on top).
-  2. Weekly Major (400+ lots) % Change Red/Green Bar Chart (red = buy, green = sell).
-  3. Dual-axis Major Headcount vs. Retail Headcount interactive touch/hover chart (auto-scaled).
+Updates in v1.8:
+- Dynamic TDCC Whale/Retail Thresholds (price + issued lots + non-mega-cap value guardrails).
+- Manual Whale Threshold Override selector (自動判定 / 100 / 200 / 400 / 600 / 1000 張) with instant zero-network re-render.
+- Closed 3-tier chip structure KPI cards & 100% stacked bar chart (大戶 + 中實戶 + 散戶 = 100%).
+- Anti-false-signal verification chart: Avg Lots per Holder (平均每戶持股張數) vs. Total Shareholders (總股東人數).
 """
 
 from __future__ import annotations
@@ -21,7 +21,11 @@ from core.ai_analyst import DEFAULT_GEMINI_MODEL, GeminiStockAnalyst
 from core.analyzer import analyze_stock_bundle
 from core.cache import TieredCache
 from core.data_fetcher import TDCC_QRY_URL, TaiwanStockDataFetcher
-from core.tdcc_analyzer import analyze_tdcc_dispersion
+from core.tdcc_analyzer import (
+    MANUAL_WHALE_OPTIONS,
+    analyze_tdcc_dispersion,
+    parse_manual_whale_option,
+)
 
 st.set_page_config(
     page_title="台股個股財報深度分析",
@@ -152,7 +156,7 @@ if run_search or ("bundle" not in st.session_state):
             )
             st.session_state.pop("ai_report_text", None)
             st.session_state.pop("news_bundle", None)
-            st.session_state.pop("tdcc_result", None)
+            st.session_state.pop("tdcc_raw", None)
         except Exception as exc:
             st.error(f"資料抓取失敗：{exc}")
             st.stop()
@@ -173,7 +177,7 @@ tabs = st.tabs(
         "📑 損益表",
         "🏦 資產負債表",
         "💰 現金流量表",
-        "🎯 集保籌碼 (每週)",
+        "🎯 集保籌碼 (動態門檻)",
         "✨ AI 診斷與訂單",
     ]
 )
@@ -274,13 +278,16 @@ with tabs[4]:
     with st.expander("🔍 展開完整現金流量表科目"):
         st.dataframe(_format_statement_df(bundle["cashflow_q_full"]), use_container_width=True, hide_index=True)
 
-# --- Tab 6: TDCC Weekly Chip-Flow Dashboard (v1.7 Dual-Axis + Bars + Touch Tooltips) ---
+# --- Tab 6: TDCC Weekly Dynamic Threshold Chip-Flow Dashboard (v1.8) ---
 with tabs[5]:
-    st.caption("資料來源：臺灣集中保管結算所（每週六更新；手指點擊或滑鼠移到任一節點即可看該週精確數據）。")
-    c_wk, c_go = st.columns([2, 2])
+    st.caption("資料來源：臺灣集中保管結算所（依個股股價與總發行張數動態判定大戶／散戶門檻，並可手動覆寫）。")
+    c_wk, c_th, c_go = st.columns([1.4, 1.4, 1.8])
     with c_wk:
-        tdcc_weeks = st.radio("抓取歷史週數", [12, 24], index=0, horizontal=True, format_func=lambda w: f"近 {w} 週")
+        tdcc_weeks = st.radio("歷史週數", [12, 24], index=0, horizontal=True, format_func=lambda w: f"近 {w} 週")
+    with c_th:
+        whale_opt = st.selectbox("大戶門檻（可手動覆寫）", MANUAL_WHALE_OPTIONS, index=0)
     with c_go:
+        st.write("")
         load_tdcc = st.button("📥 載入集保籌碼流向走勢圖", type="primary", use_container_width=True)
 
     cached_tdcc = cache.get(f"tdcc_bundle:{meta['stock_id']}:{tdcc_weeks}")
@@ -294,100 +301,146 @@ with tabs[5]:
             meta["stock_id"], weeks=tdcc_weeks, force_refresh=force_refresh, progress_cb=_on_prog
         )
         prog.empty()
-        st.session_state["tdcc_result"] = analyze_tdcc_dispersion(raw_tdcc)
-    elif "tdcc_result" not in st.session_state and cached_tdcc:
-        st.session_state["tdcc_result"] = analyze_tdcc_dispersion(cached_tdcc)
+        st.session_state["tdcc_raw"] = raw_tdcc
+    elif "tdcc_raw" not in st.session_state and cached_tdcc:
+        st.session_state["tdcc_raw"] = cached_tdcc
 
-    tdcc_res = st.session_state.get("tdcc_result")
+    raw_tdcc_mem = st.session_state.get("tdcc_raw")
+    tdcc_res = (
+        analyze_tdcc_dispersion(
+            raw_tdcc_mem,
+            price=price.get("close"),
+            manual_whale_level=parse_manual_whale_option(whale_opt),
+        )
+        if raw_tdcc_mem
+        else None
+    )
+
     if tdcc_res and tdcc_res.get("has_data"):
         s = tdcc_res["summary"]
         sig_icon = {"green": "🟢", "yellow": "🟡", "red": "🔴", "info": "🔵"}.get(s["signal_status"], "⚪")
         st.info(
-            f"**{sig_icon} 籌碼流向判讀：{s['signal_title']}**（基準日 `{s['latest_date']}`｜{s['weeks_count']} 週）\n\n"
+            f"**{sig_icon} {s['signal_title']}**（基準日 `{s['latest_date']}`｜{s['weeks_count']} 週）\n\n"
+            f"**【{s['mode_tag']}】** 股價 `{s['price_used']}` 元、總發行 `{s['total_lots_wan']:.1f}` 萬張 → "
+            f"**{s['whale_label']}**（門檻約 `{s['whale_value_m']:.0f}` 百萬）／ **{s['mid_label']}** ／ **{s['retail_label']}**\n\n"
             f"{s['signal_desc']}"
         )
 
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("400張以上大戶 (%)", f"{s['major_400_pct']:.2f}%", delta=f"{s['d_400_1w']:+.2f}% (週)")
-        k2.metric("400張以上大戶人數", f"{s['major_400_people']:,} 人", delta=f"{s['d_m400_ppl_1w']:+,} 人 (週)")
-        k3.metric("散戶 10張以下 (%)", f"{s['retail_10_pct']:.2f}%", delta=f"{s['d_ret10_1w']:+.2f}% (週)", delta_color="inverse")
-        k4.metric("散戶 10張以下人數", f"{s['retail_10_people']:,} 人", delta=f"{s['d_ret10_ppl_1w']:+,} 人 (週)", delta_color="inverse")
+        # Row 1: Closed 3-tier chip structure (大戶 + 中實戶 + 散戶 = 100%)
+        k1, k2, k3 = st.columns(3)
+        k1.metric(f"🔴 {s['whale_label']}", f"{s['whale_pct']:.2f}%", delta=f"{s['d_whale_1w']:+.2f}% ({s['whale_people']:,}人)")
+        k2.metric(f"🟠 {s['mid_label']}", f"{s['mid_pct']:.2f}%", delta=f"{s['d_mid_1w']:+.2f}% ({s['mid_people']:,}人)", delta_color="off")
+        k3.metric(f"🔵 {s['retail_label']}", f"{s['retail_pct']:.2f}%", delta=f"{s['d_retail_1w']:+.2f}% ({s['retail_people']:,}人)", delta_color="inverse")
+
+        # Row 2: Anti-false-signal verification KPIs
+        v1, v2 = st.columns(2)
+        v1.metric("👥 總股東人數（驗證指標）", f"{s['total_people']:,} 人", delta=f"{s['d_people_1w']:+,} 人 (週)", delta_color="inverse")
+        v2.metric("📦 平均每戶持股張數（消除跨級距假訊號）", f"{s['avg_lots']:.2f} 張/戶", delta=f"{s['d_avg_lots_1w']:+.2f} 張 (週)")
 
         trend_df = tdcc_res["trend_df"].copy()
         if len(trend_df) >= 2:
             full_tooltips = [
                 alt.Tooltip("日期:N", title="基準日"),
-                alt.Tooltip("400張以上大戶(%):Q", title="400張大戶(%)", format=".2f"),
-                alt.Tooltip("400張大戶週增減(%):Q", title="大戶週增減(%)", format="+.2f"),
-                alt.Tooltip("400張以上大戶人數:Q", title="400張大戶人數", format=","),
-                alt.Tooltip("1000張以上大戶(%):Q", title="1000張大戶(%)", format=".2f"),
-                alt.Tooltip("散戶_10張以下(%):Q", title="散戶10張以下(%)", format=".2f"),
-                alt.Tooltip("散戶_10張以下人數:Q", title="散戶10張以下人數", format=","),
+                alt.Tooltip("大戶比例(%):Q", title=f"{s['whale_label']} %", format=".2f"),
+                alt.Tooltip("大戶週增減(%):Q", title="大戶週增減(%)", format="+.2f"),
+                alt.Tooltip("大戶人數:Q", title="大戶人數", format=","),
+                alt.Tooltip("中實戶比例(%):Q", title=f"{s['mid_label']} %", format=".2f"),
+                alt.Tooltip("散戶比例(%):Q", title=f"{s['retail_label']} %", format=".2f"),
+                alt.Tooltip("散戶人數:Q", title="散戶人數", format=","),
                 alt.Tooltip("總股東人數:Q", title="總股東人數", format=","),
+                alt.Tooltip("平均每戶持股(張):Q", title="平均每戶(張)", format=".2f"),
             ]
 
-            # Chart 1: Dual-Axis Scissor Spread (400+ Major % vs <10 Retail %)
-            st.subheader("① 大戶 vs. 散戶持股比例雙軸走勢（紅升藍降＝籌碼集中）")
+            # Chart 1: Dual-Axis Scissor Spread (Whale % vs Retail %)
+            st.subheader(f"① {s['whale_label']} vs. {s['retail_label']} 雙軸走勢（紅升藍降＝籌碼集中）")
             base1 = alt.Chart(trend_df).encode(x=alt.X("日期:N", sort=None, title="集保基準日"))
-            line_major = base1.mark_line(point=alt.OverlayMarkDef(size=55), color="#E53935", strokeWidth=2.5).encode(
-                y=alt.Y("400張以上大戶(%):Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="400張以上大戶 (%)", titleColor="#E53935")),
+            line_whale = base1.mark_line(point=alt.OverlayMarkDef(size=55), color="#E53935", strokeWidth=2.5).encode(
+                y=alt.Y("大戶比例(%):Q", scale=alt.Scale(zero=False), axis=alt.Axis(title=f"{s['whale_label']} (%)", titleColor="#E53935")),
                 tooltip=full_tooltips,
             )
             line_retail = base1.mark_line(point=alt.OverlayMarkDef(size=55), color="#1E88E5", strokeWidth=2.2, strokeDash=[5, 3]).encode(
-                y=alt.Y("散戶_10張以下(%):Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="散戶 10張以下 (%)", titleColor="#1E88E5")),
+                y=alt.Y("散戶比例(%):Q", scale=alt.Scale(zero=False), axis=alt.Axis(title=f"{s['retail_label']} (%)", titleColor="#1E88E5")),
                 tooltip=full_tooltips,
             )
             st.altair_chart(
-                alt.layer(line_major, line_retail).resolve_scale(y="independent").properties(height=270),
+                alt.layer(line_whale, line_retail).resolve_scale(y="independent").properties(height=270),
                 use_container_width=True,
             )
 
-            # Chart 2: Weekly 400+ Major % Change Red/Green Bar Chart
-            st.subheader("② 400張以上大戶「每週增減」柱狀圖（紅柱加碼｜綠柱減碼）")
+            # Chart 2: Weekly Whale % Change Red/Green Bar Chart
+            st.subheader(f"② {s['whale_label']}「每週增減」柱狀圖（紅柱加碼｜綠柱減碼）")
             bar_chart = (
                 alt.Chart(trend_df)
                 .mark_bar()
                 .encode(
                     x=alt.X("日期:N", sort=None, title="集保基準日"),
-                    y=alt.Y("400張大戶週增減(%):Q", title="每週增減 (%)"),
+                    y=alt.Y("大戶週增減(%):Q", title="每週增減 (%)"),
                     color=alt.condition(
-                        alt.datum["400張大戶週增減(%)"] >= 0,
+                        alt.datum["大戶週增減(%)"] >= 0,
                         alt.value("#E53935"),
                         alt.value("#2E7D32"),
                     ),
                     tooltip=full_tooltips,
                 )
-                .properties(height=210)
+                .properties(height=205)
             )
             st.altair_chart(bar_chart, use_container_width=True)
 
-            # Chart 3: Dual-Axis Headcount (400+ Major Headcount vs <10 Retail Headcount)
-            st.subheader("③ 大戶人數 vs. 散戶人數雙軸走勢（各自縮放看人數消長）")
+            # Chart 3: Anti-False-Signal Verification (Avg Lots/Holder vs Total Shareholders)
+            st.subheader("③ 消除跨級距假訊號：平均每戶持股張數 vs. 總股東人數")
             base3 = alt.Chart(trend_df).encode(x=alt.X("日期:N", sort=None, title="集保基準日"))
-            line_mppl = base3.mark_line(point=alt.OverlayMarkDef(size=55), color="#FB8C00", strokeWidth=2.5).encode(
-                y=alt.Y("400張以上大戶人數:Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="400張以上大戶人數", titleColor="#FB8C00")),
+            line_avg = base3.mark_line(point=alt.OverlayMarkDef(size=55), color="#FB8C00", strokeWidth=2.5).encode(
+                y=alt.Y("平均每戶持股(張):Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="平均每戶持股 (張/戶)", titleColor="#FB8C00")),
                 tooltip=full_tooltips,
             )
-            line_rppl = base3.mark_line(point=alt.OverlayMarkDef(size=55), color="#26A69A", strokeWidth=2.2).encode(
-                y=alt.Y("散戶_10張以下人數:Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="散戶 10張以下人數", titleColor="#26A69A")),
+            line_tot = base3.mark_line(point=alt.OverlayMarkDef(size=55), color="#26A69A", strokeWidth=2.2).encode(
+                y=alt.Y("總股東人數:Q", scale=alt.Scale(zero=False), axis=alt.Axis(title="總股東人數 (人)", titleColor="#26A69A")),
                 tooltip=full_tooltips,
             )
             st.altair_chart(
-                alt.layer(line_mppl, line_rppl).resolve_scale(y="independent").properties(height=260),
+                alt.layer(line_avg, line_tot).resolve_scale(y="independent").properties(height=250),
                 use_container_width=True,
             )
 
-        with st.expander("📅 展開每週大戶／散戶歷史數據表"):
+            # Chart 4: 100% Stacked Bar Chart of 3-tier Chip Structure (Whale + Mid + Retail = 100%)
+            with st.expander("📊 展開籌碼三結構（大戶＋中實戶＋散戶 = 100%）堆疊長條圖", expanded=True):
+                melt_3 = trend_df.melt(
+                    id_vars=["日期"],
+                    value_vars=["大戶比例(%)", "中實戶比例(%)", "散戶比例(%)"],
+                    var_name="族群",
+                    value_name="比例(%)",
+                )
+                stack_chart = (
+                    alt.Chart(melt_3)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("日期:N", sort=None, title="集保基準日"),
+                        y=alt.Y("比例(%):Q", stack="normalize", title="籌碼結構比例 (100%)"),
+                        color=alt.Color(
+                            "族群:N",
+                            scale=alt.Scale(
+                                domain=["大戶比例(%)", "中實戶比例(%)", "散戶比例(%)"],
+                                range=["#E53935", "#FB8C00", "#1E88E5"],
+                            ),
+                            legend=alt.Legend(orient="top", title=None),
+                        ),
+                        tooltip=["日期", "族群", alt.Tooltip("比例(%):Q", format=".2f")],
+                    )
+                    .properties(height=220)
+                )
+                st.altair_chart(stack_chart, use_container_width=True)
+
+        with st.expander("📅 展開每週籌碼歷史數據表"):
             show_cols = [
-                "日期", "400張以上大戶(%)", "400張大戶週增減(%)", "400張以上大戶人數",
-                "1000張以上大戶(%)", "散戶_10張以下(%)", "散戶_10張以下人數", "總股東人數",
+                "日期", "大戶比例(%)", "大戶週增減(%)", "中實戶比例(%)", "散戶比例(%)",
+                "大戶人數", "散戶人數", "總股東人數", "平均每戶持股(張)",
             ]
             st.dataframe(trend_df[show_cols].iloc[::-1], use_container_width=True, hide_index=True)
     elif load_tdcc:
         st.warning(f"暫時無法取得 {meta['stock_id']} 的集保資料，請稍後再試或前往 [集保結算所官網]({TDCC_QRY_URL}) 查詢。")
     else:
         st.markdown(
-            "點擊上方 **「📥 載入集保籌碼流向走勢圖」** 即可繪製大戶 vs. 散戶雙軸走勢、每週紅綠增減柱狀圖與大戶／散戶人數變化圖。"
+            "點擊上方 **「📥 載入集保籌碼流向走勢圖」** 即可自動依股價與股本計算專屬門檻並繪製大戶／中實戶／散戶籌碼流向。"
         )
 
 # --- Tab 7: AI Layer-2 & Order Visibility ---
